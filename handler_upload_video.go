@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
@@ -83,6 +87,12 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	aspectRatio, err := getVideoAspectRatio(tmpFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to get video aspect ratio", err)
+		return
+	}
+
 	var keyData [32]byte
 	_, err = rand.Read(keyData[:])
 	if err != nil {
@@ -90,7 +100,15 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	key := hex.EncodeToString(keyData[:])
+	prefix := "other"
+	switch aspectRatio {
+	case "16:9":
+		prefix = "landscape"
+	case "9:16":
+		prefix = "portrait"
+	}
+
+	key := fmt.Sprintf("%s/%s", prefix, hex.EncodeToString(keyData[:]))
 
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
@@ -113,4 +131,43 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, video)
+}
+
+func getVideoAspectRatio(filepath string) (string, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filepath)
+
+	var output bytes.Buffer
+	cmd.Stdout = &output
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("run ffprobe: %w", err)
+	}
+
+	var probeResult struct {
+		Streams []struct {
+			CodecType string `json:"codec_type"`
+			Width     int    `json:"width"`
+			Height    int    `json:"height"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &probeResult); err != nil {
+		return "", err
+	}
+
+	for _, stream := range probeResult.Streams {
+		if stream.CodecType != "video" || stream.Width <= 0 || stream.Height <= 0 {
+			continue
+		}
+
+		aspectRatio := float64(stream.Width) / float64(stream.Height)
+		if math.Abs(aspectRatio-16.0/9.0) <= 0.01 {
+			return "16:9", nil
+		}
+		if math.Abs(aspectRatio-9.0/16.0) <= 0.01 {
+			return "9:16", nil
+		}
+		return "other", nil
+	}
+
+	return "", fmt.Errorf("ffprobe found no video stream with valid dimensions")
 }
