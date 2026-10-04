@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -12,9 +13,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
+	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/database"
 	"github.com/google/uuid"
 )
 
@@ -135,7 +139,8 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, key)
+	// videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, key)
+	videoURL := cfg.s3Bucket + "," + key
 	video.VideoURL = &videoURL
 
 	err = cfg.db.UpdateVideo(video)
@@ -144,7 +149,13 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, video)
+	signedVideo, err := cfg.dbVideoToSignedVideo(video)
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, "Couldn't get signed video", err)
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, signedVideo)
 }
 
 func getVideoAspectRatio(filePath string) (string, error) {
@@ -196,4 +207,39 @@ func processVideoForFastStart(filePath string) (string, error) {
 	}
 
 	return newPath, nil
+}
+
+func (cfg *apiConfig) dbVideoToSignedVideo(video database.Video) (database.Video, error) {
+	if video.VideoURL == nil || *video.VideoURL == "" {
+		return video, nil
+	}
+
+	bucket, key, found := strings.Cut(*video.VideoURL, ",")
+	if !found || bucket == "" || key == "" {
+		return video, fmt.Errorf("invalid stored video URL %q: expected bucket,key", *video.VideoURL)
+	}
+
+	presignedURL, err := generatePresignedURL(cfg.s3Client, bucket, key, 30*time.Minute)
+	if err != nil {
+		return video, err
+	}
+
+	video.VideoURL = &presignedURL
+	return video, nil
+}
+
+func generatePresignedURL(s3Client *s3.Client, bucket, key string, expireTime time.Duration) (string, error) {
+	c := s3.NewPresignClient(s3Client)
+
+	p := s3.GetObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	}
+
+	r, err := c.PresignGetObject(context.TODO(), &p, s3.WithPresignExpires(expireTime))
+	if err != nil {
+		return "", err
+	}
+
+	return r.URL, nil
 }
